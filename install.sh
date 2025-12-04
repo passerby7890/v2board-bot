@@ -27,7 +27,7 @@ fi
 
 # 2. 下載代碼 (這裡假設你會上傳到 GitHub，現在先用本地創建的方式演示)
 # 實際使用時，請取消註釋下面這行，並替換你的倉庫地址
-# git clone https://github.com/你的用戶名/你的倉庫.git /root/v2bot
+# git clone https://github.com/passerby7890/v2board-bot.git /root/v2bot
 # cd /root/v2bot
 
 # --- 模擬下載文件 (如果你還沒上傳 GitHub，腳本會自動創建文件) ---
@@ -38,8 +38,8 @@ cd $WORK_DIR
 # (這裡腳本會自動檢查目錄下是否有 bot.py，如果沒有則提示用戶)
 if [ ! -f "bot.py" ]; then
     echo -e "${YELLOW}檢測到目錄為空，正在下載最新代碼... (請替換真實 GitHub 地址)${PLAIN}"
-    # wget https://raw.githubusercontent.com/你的用戶名/倉庫/main/bot.py
-    # wget https://raw.githubusercontent.com/你的用戶名/倉庫/main/requirements.txt
+    # wget https://raw.githubusercontent.com/passerby7890/v2board-bot/refs/heads/main/bot.py
+    # wget https://raw.githubusercontent.com/passerby7890/v2board-bot/refs/heads/main/requirements.txt
 fi
 # -----------------------------------------------------------
 
