@@ -17,7 +17,8 @@ V2Board/XBoard Telegram 簽到機器人 (SQL 直連版)
 
 一鍵腳本 (推薦)
 
-wget -O install.sh [[https://raw.githubusercontent.com/passerby7890/v2board-bot/main/install.sh](https://raw.githubusercontent.com/passerby7890/v2board-bot/refs/heads/main/install.sh)]([https://raw.githubusercontent.com/passerby7890/v2board-bot/main/install.sh](https://raw.githubusercontent.com/passerby7890/v2board-bot/refs/heads/main/install.sh)) && chmod +x install.sh && ./install.sh
+wget -O install.sh [https://raw.githubusercontent.com/passerby7890/v2board-bot/main/install.sh](https://raw.githubusercontent.com/passerby7890/v2board-bot/main/install.sh) && chmod +x install.sh && ./install.sh
+
 
 
 
