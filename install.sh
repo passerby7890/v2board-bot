@@ -3,8 +3,8 @@
 # =================配置区域=================
 # 项目安装目录
 WORK_DIR="/root/v2bot"
-# GitHub 仓库地址
-REPO_URL="https://github.com/passerby7890/v2board-bot.git"
+# 文件的下载基准地址 (Raw URL)
+BASE_URL="https://raw.githubusercontent.com/passerby7890/v2board-bot/main"
 # =========================================
 
 # 定义颜色
@@ -14,8 +14,8 @@ YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
 echo -e "${GREEN}=============================================${PLAIN}"
-echo -e "${GREEN}    V2Board/XBoard 签到机器人 一键安装脚本    ${PLAIN}"
-echo -e "${GREEN}    模式：Python 虚拟环境 | 自动拉取 | Systemd    ${PLAIN}"
+echo -e "${GREEN}    V2Board Bot 安装脚本 (强制更新版)        ${PLAIN}"
+echo -e "${GREEN}    模式：Wget 强制下载 | 虚拟环境 | Systemd   ${PLAIN}"
 echo -e "${GREEN}=============================================${PLAIN}"
 
 # 检查 Root 权限
@@ -27,71 +27,68 @@ fi
 # 1. 准备系统环境
 echo -e "${YELLOW}[1/5] 正在检查并安装系统依赖...${PLAIN}"
 if [ -f /etc/debian_version ]; then
-    apt update && apt install -y python3 python3-pip python3-venv git wget
+    apt update && apt install -y python3 python3-pip python3-venv wget
 elif [ -f /etc/redhat-release ]; then
-    yum install -y python3 python3-pip git wget
-    # CentOS 可能需要单独处理 venv，视版本而定，通常包含在 python3 中
+    yum install -y python3 python3-pip wget
 fi
 
-# 2. 拉取/更新代码
-echo -e "${YELLOW}[2/5] 正在从 GitHub 拉取代码...${PLAIN}"
-if [ -d "$WORK_DIR" ]; then
-    echo -e "${GREEN}检测到目录已存在，正在备份配置文件并更新代码...${PLAIN}"
-    cd $WORK_DIR
-    # 备份 .env
-    [ -f ".env" ] && cp .env .env.bak
-    
-    # 强制拉取最新代码
-    git fetch --all
-    git reset --hard origin/main
-    git pull
-    
-    # 还原 .env
-    [ -f ".env.bak" ] && mv .env.bak .env
+# 创建工作目录
+mkdir -p $WORK_DIR
+cd $WORK_DIR
+
+# 2. 强制下载核心文件 (这里是修改的重点)
+echo -e "${YELLOW}[2/5] 正在强制下载最新代码...${PLAIN}"
+
+# 强制下载 bot.py
+wget -O bot.py "${BASE_URL}/bot.py"
+if [ ! -s "bot.py" ]; then
+    echo -e "${RED}错误：bot.py 下载失败或文件为空！请检查网络或 GitHub 地址。${PLAIN}"
+    exit 1
 else
-    echo -e "${GREEN}目录不存在，正在克隆仓库...${PLAIN}"
-    git clone $REPO_URL $WORK_DIR
-    cd $WORK_DIR
+    echo -e "${GREEN}bot.py 下载成功。${PLAIN}"
 fi
 
-# 3. 配置 Python 虚拟环境 (关键修复步骤)
+# 强制下载 requirements.txt (如果仓库里没有这个文件，这一步会报 404，但不影响后续运行，我会做个判断)
+wget -O requirements.txt "${BASE_URL}/requirements.txt" 2>/dev/null
+if [ ! -s "requirements.txt" ]; then
+    echo -e "${YELLOW}提示：线上未找到 requirements.txt，将使用内置依赖列表。${PLAIN}"
+    rm -f requirements.txt
+fi
+
+
+# 3. 配置 Python 虚拟环境
 echo -e "${YELLOW}[3/5] 正在配置 Python 虚拟环境 (venv)...${PLAIN}"
-# 创建虚拟环境文件夹 venv
 if [ ! -d "venv" ]; then
     python3 -m venv venv
     echo -e "${GREEN}虚拟环境创建成功。${PLAIN}"
 fi
 
-# 激活虚拟环境并安装依赖
-echo -e "正在安装 Python 依赖 (requirements.txt)..."
+# 激活环境并安装依赖
+echo -e "正在安装依赖库..."
 ./venv/bin/pip install --upgrade pip
+
 if [ -f "requirements.txt" ]; then
     ./venv/bin/pip install -r requirements.txt
 else
-    echo -e "${RED}警告：未找到 requirements.txt，尝试手动安装基础依赖...${PLAIN}"
+    # 如果没有下载到 requirements.txt，则手动安装你需要的库
     ./venv/bin/pip install python-telegram-bot pymysql python-dotenv
 fi
+
 
 # 4. 配置引导 (.env)
 echo -e "${YELLOW}[4/5] 检查配置文件...${PLAIN}"
 
 if [ -f ".env" ]; then
-    echo -e "${GREEN}检测到 .env 文件已存在，跳过配置。${PLAIN}"
-    echo -e "如果需要修改，请手动编辑: nano $WORK_DIR/.env"
+    echo -e "${GREEN}检测到 .env 文件已存在，保留原有配置。${PLAIN}"
 else
-    echo -e "${GREEN}>>> 请根据提示输入配置信息 <<<${PLAIN}"
+    echo -e "${GREEN}>>> 新环境，请输入配置信息 <<<${PLAIN}"
     
     read -p "请输入 Telegram Bot Token: " input_token
-    
     read -p "请输入 数据库地址 (默认 127.0.0.1): " input_db_host
     input_db_host=${input_db_host:-127.0.0.1}
-    
-    read -p "请输入 数据库名 (例如 0n21_com): " input_db_name
-    
-    read -p "请输入 数据库用户名 (例如 0n21_com): " input_db_user
-    
+    read -p "请输入 数据库名: " input_db_name
+    read -p "请输入 数据库用户名: " input_db_user
     read -p "请输入 数据库密码: " input_db_pass
-    
     read -p "请输入 用户表名 (默认 v2_user): " input_table_user
     input_table_user=${input_table_user:-v2_user}
 
@@ -111,9 +108,8 @@ EOF
 fi
 
 # 5. 设置 Systemd 守护进程
-echo -e "${YELLOW}[4/5] 设置开机自启服务...${PLAIN}"
+echo -e "${YELLOW}[5/5] 设置开机自启服务...${PLAIN}"
 
-# 注意：ExecStart 指向的是 venv 里的 python，而不是系统的 python
 cat > /etc/systemd/system/v2bot.service <<EOF
 [Unit]
 Description=V2Board Telegram Bot
@@ -138,10 +134,8 @@ systemctl restart v2bot
 
 # 6. 完成
 echo -e "${GREEN}=============================================${PLAIN}"
-echo -e "${GREEN} ✅ 安装完成！服务已重启！ ${PLAIN}"
+echo -e "${GREEN} ✅ 更新/安装完成！服务已重启！ ${PLAIN}"
 echo -e "${GREEN}=============================================${PLAIN}"
 echo -e "常用指令："
-echo -e "查看状态: systemctl status v2bot"
 echo -e "查看日志: journalctl -u v2bot -f"
 echo -e "重启服务: systemctl restart v2bot"
-echo -e "修改配置: nano $WORK_DIR/.env"
