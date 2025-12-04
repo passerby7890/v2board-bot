@@ -13,9 +13,36 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
+# ==========================================================
+# 0. 暴力强制安装 Wget (不管有没有，先装一遍)
+# ==========================================================
+echo -e "${YELLOW}[0/5] 正在强制检查并安装 Wget 工具...${PLAIN}"
+
+if [[ -f /etc/redhat-release ]]; then
+    # CentOS / RHEL / Fedora / Alibaba Cloud Linux
+    echo "检测到 RHEL/CentOS 系系统..."
+    yum -y install wget
+elif [[ -f /etc/debian_version ]]; then
+    # Debian / Ubuntu / Kali
+    echo "检测到 Debian/Ubuntu 系系统..."
+    apt-get update -y >/dev/null 2>&1
+    apt-get -y install wget
+else
+    echo -e "${RED}未检测到常见系统版本，尝试通用安装...${PLAIN}"
+    yum -y install wget || apt-get -y install wget
+fi
+
+# 检查是否真的装上了
+if ! command -v wget &> /dev/null; then
+    echo -e "${RED}错误：Wget 安装失败！请手动安装 wget 后重试。${PLAIN}"
+    exit 1
+fi
+# ==========================================================
+
+
 echo -e "${GREEN}=============================================${PLAIN}"
-echo -e "${GREEN}    V2Board Bot 安装脚本 (强制更新版)        ${PLAIN}"
-echo -e "${GREEN}    模式：Wget 强制下载 | 虚拟环境 | Systemd   ${PLAIN}"
+echo -e "${GREEN}    V2Board Bot 安装脚本 (强力版)            ${PLAIN}"
+echo -e "${GREEN}    模式：强制 Wget | 虚拟环境 | Systemd       ${PLAIN}"
 echo -e "${GREEN}=============================================${PLAIN}"
 
 # 检查 Root 权限
@@ -24,37 +51,36 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 1. 准备系统环境
-echo -e "${YELLOW}[1/5] 正在检查并安装系统依赖...${PLAIN}"
-if [ -f /etc/debian_version ]; then
-    apt update && apt install -y python3 python3-pip python3-venv wget
-elif [ -f /etc/redhat-release ]; then
-    yum install -y python3 python3-pip wget
+# 1. 准备系统环境 (Python)
+echo -e "${YELLOW}[1/5] 正在安装 Python 环境...${PLAIN}"
+if [[ -f /etc/redhat-release ]]; then
+    yum -y install python3 python3-pip
+elif [[ -f /etc/debian_version ]]; then
+    apt-get -y install python3 python3-pip python3-venv
 fi
 
 # 创建工作目录
 mkdir -p $WORK_DIR
 cd $WORK_DIR
 
-# 2. 强制下载核心文件 (这里是修改的重点)
+# 2. 强制下载核心文件
 echo -e "${YELLOW}[2/5] 正在强制下载最新代码...${PLAIN}"
 
 # 强制下载 bot.py
 wget -O bot.py "${BASE_URL}/bot.py"
 if [ ! -s "bot.py" ]; then
-    echo -e "${RED}错误：bot.py 下载失败或文件为空！请检查网络或 GitHub 地址。${PLAIN}"
+    echo -e "${RED}错误：bot.py 下载失败！请检查服务器网络能否访问 GitHub。${PLAIN}"
     exit 1
 else
     echo -e "${GREEN}bot.py 下载成功。${PLAIN}"
 fi
 
-# 强制下载 requirements.txt (如果仓库里没有这个文件，这一步会报 404，但不影响后续运行，我会做个判断)
+# 尝试下载 requirements.txt，如果没有就忽略
 wget -O requirements.txt "${BASE_URL}/requirements.txt" 2>/dev/null
 if [ ! -s "requirements.txt" ]; then
-    echo -e "${YELLOW}提示：线上未找到 requirements.txt，将使用内置依赖列表。${PLAIN}"
+    echo -e "${YELLOW}提示：线上未找到 requirements.txt，将使用脚本内置依赖。${PLAIN}"
     rm -f requirements.txt
 fi
-
 
 # 3. 配置 Python 虚拟环境
 echo -e "${YELLOW}[3/5] 正在配置 Python 虚拟环境 (venv)...${PLAIN}"
@@ -64,16 +90,15 @@ if [ ! -d "venv" ]; then
 fi
 
 # 激活环境并安装依赖
-echo -e "正在安装依赖库..."
+echo -e "正在安装 Python 依赖库..."
 ./venv/bin/pip install --upgrade pip
 
 if [ -f "requirements.txt" ]; then
     ./venv/bin/pip install -r requirements.txt
 else
-    # 如果没有下载到 requirements.txt，则手动安装你需要的库
+    # 内置依赖列表
     ./venv/bin/pip install python-telegram-bot pymysql python-dotenv
 fi
-
 
 # 4. 配置引导 (.env)
 echo -e "${YELLOW}[4/5] 检查配置文件...${PLAIN}"
@@ -134,7 +159,7 @@ systemctl restart v2bot
 
 # 6. 完成
 echo -e "${GREEN}=============================================${PLAIN}"
-echo -e "${GREEN} ✅ 更新/安装完成！服务已重启！ ${PLAIN}"
+echo -e "${GREEN} ✅ 安装完成！服务已重启！ ${PLAIN}"
 echo -e "${GREEN}=============================================${PLAIN}"
 echo -e "常用指令："
 echo -e "查看日志: journalctl -u v2bot -f"
