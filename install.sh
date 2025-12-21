@@ -277,7 +277,7 @@ class DataManager:
             return r.json().get('data')
         except: return None
 
-    # 安全重置：Token+UUID (不碰Password)
+    # [安全版] 仅重置 Token/UUID/UpdateAt，不改 Password
     @classmethod
     async def reset_security_direct(cls, user_id, email):
         new_token = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
@@ -348,8 +348,7 @@ async def info(u, c):
         p_name = await DataManager.get_plan_name(user.get('plan_id'))
         used = safe_int(user.get('u')) + safe_int(user.get('d'))
         trans = safe_int(user.get('transfer_enable'))
-        expire_ts = safe_int(user.get('expired_at'))
-        expire = datetime.fromtimestamp(expire_ts).strftime('%Y-%m-%d') if expire_ts > 0 else "长期有效"
+        expire = datetime.fromtimestamp(safe_int(user.get('expired_at'))).strftime('%Y-%m-%d') if safe_int(user.get('expired_at')) > 0 else "长期有效"
         
         await u.message.reply_text(f"👤 <b>账户信息</b>\n📧 {email}\n📦 {p_name}\n⏳ 到期: {expire}\n🌊 流量: {format_bytes(used)} / {format_bytes(trans)}\n{get_progress_bar(used, trans)}", parse_mode=ParseMode.HTML)
     except Exception as e: await u.message.reply_text(f"❌ 错误: {e}")
@@ -367,7 +366,7 @@ async def reset_sub(u, c):
     email = await redis_client.get(f"v2bot:bind:{u.effective_user.id}")
     if not email: return
     user = await DataManager.get_user_by_email(email)
-    msg = await u.message.reply_text("🔄 正在安全重置订阅...")
+    msg = await u.message.reply_text("🔄 正在安全重置订阅与节点连接...")
     try:
         new_token = await DataManager.reset_security_direct(user['id'], email)
         domain = await DataManager.get_sub_domain()
@@ -386,7 +385,7 @@ async def show_payment_methods(tn, amt, update):
     if not methods: return await update.callback_query.edit_message_text(f"✅ 订单 {tn} 存在，但无支付方式。")
     kb = [[InlineKeyboardButton(f"💳 {m['name']}", callback_data=f"step2:{tn}:{m['id']}")] for m in methods]
     kb.append([InlineKeyboardButton("❌ 取消订单", callback_data=f"cancel:{tn}")])
-    await update.callback_query.edit_message_text(f"🧾 <b>订单确认</b>\n单号：<code>{tn}</code>\n金额：{amt}\n\n👇 <b>请选择支付方式：</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+    await update.callback_query.edit_message_text(f"🧾 订单确认\n单号：<code>{tn}</code>\n金额：{amt}\n\n👇 请选择支付方式：", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
 async def btn_handler(u, c):
     q = u.callback_query; await q.answer(); data = q.data.split(":"); action = data[0]
@@ -410,7 +409,7 @@ async def btn_handler(u, c):
         await redis_client.sadd("v2bot:pending_orders", trade_no)
         await redis_client.set(f"v2bot:order_owner:{trade_no}", tg_id, ex=7200)
         kb = [[InlineKeyboardButton("🚀 点击跳转支付", url=pay_url)], [InlineKeyboardButton("⬅️ 返回", callback_data="back_to_shop")]]
-        await q.edit_message_text(f"✅ <b>支付链接已生成</b>\n\n单号：<code>{trade_no}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(f"✅ 支付链接已生成\n单号：<code>{trade_no}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     elif action == "cancel": await DataManager.cancel_order(data[1], user['id']); await q.edit_message_text("🗑️ 订单已取消。")
     elif action == "back_to_shop": await q.message.delete(); await shop(u, c)
 
@@ -454,15 +453,12 @@ async def checkin(u, c):
     await DataManager.add_traffic(user['id'], final_bytes, email)
     await redis_client.set(f"v2bot:checkin:{tg_id}:{today}", 1, ex=86400)
     await redis_client.set(f"v2bot:last_date:{tg_id}", today); await redis_client.set(f"v2bot:streak:{tg_id}", streak)
-    
-    # 精美回复
     header = "🎰 <b>欧皇附体！</b>" if is_crit else "🎉 <b>签到成功！</b>"
     user_upd = await DataManager.get_user_by_email(email)
     p_name = await DataManager.get_plan_name(user_upd.get('plan_id'))
     used = safe_int(user_upd.get('u')) + safe_int(user_upd.get('d'))
     trans = safe_int(user_upd.get('transfer_enable'))
-    expire_ts = safe_int(user_upd.get('expired_at'))
-    expire = datetime.fromtimestamp(expire_ts).strftime('%Y-%m-%d') if expire_ts > 0 else "无限期"
+    expire = datetime.fromtimestamp(safe_int(user_upd.get('expired_at'))).strftime('%Y-%m-%d') if safe_int(user_upd.get('expired_at')) > 0 else "无限期"
     await process_msg.edit_text(f"{header}\n👤 用户：{u.effective_user.first_name}\n🔥 连签：<b>{streak}</b> 天\n💡 {reason}\n\n📦 套餐：{p_name}\n⏳ 到期：{expire}\n🎁 奖励：x{mult} (<b>{format_bytes(final_bytes)}</b>)\n📊 使用：{format_bytes(used)} / {format_bytes(trans)}\n{get_progress_bar(used, trans)}", parse_mode=ParseMode.HTML)
 
 async def payment_monitor(bot):
@@ -517,12 +513,32 @@ EOF
     systemctl daemon-reload
 }
 
+function check_status() {
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        echo -e "状态: ${GREEN}运行中${PLAIN}"
+    else
+        echo -e "状态: ${RED}未运行${PLAIN}"
+    fi
+}
+
 function install_bot() { install_env; manage_config; write_bot_code; create_service; systemctl enable $SERVICE_NAME; systemctl restart $SERVICE_NAME; echo -e "${GREEN}✅ 安装/更新完成${PLAIN}"; }
+function start_bot() { systemctl start $SERVICE_NAME; echo -e "${GREEN}已启动${PLAIN}"; }
+function stop_bot() { systemctl stop $SERVICE_NAME; echo -e "${GREEN}已停止${PLAIN}"; }
 function restart_bot() { systemctl restart $SERVICE_NAME; echo -e "${GREEN}已重启${PLAIN}"; }
 function view_logs() { journalctl -u $SERVICE_NAME -f; }
+function uninstall_bot() { systemctl stop $SERVICE_NAME; systemctl disable $SERVICE_NAME; rm -f /etc/systemd/system/$SERVICE_NAME.service; rm -rf $WORK_DIR; systemctl daemon-reload; echo -e "${GREEN}卸载完成${PLAIN}"; }
 
 clear
-echo -e "${GREEN} V2Board Bot (最终通用版) ${PLAIN}"
-echo " 1. 安装/覆盖更新"; echo " 4. 重启"; echo " 5. 查看日志"; echo " 0. 退出"
+echo -e "${GREEN} V2Board Bot (智能平滑升级版) ${PLAIN}"; check_status
+echo " 1. 安装/更新"; echo " 2. 启动"; echo " 3. 停止"; echo " 4. 重启"; echo " 5. 日志"; echo " 6. 卸载"; echo " 0. 退出"
 read -p " 请输入: " n
-case "$n" in 1) install_bot ;; 4) restart_bot ;; 5) view_logs ;; 0) exit 0 ;; esac
+case "$n" in
+    1) install_bot ;;
+    2) start_bot ;;
+    3) stop_bot ;;
+    4) restart_bot ;;
+    5) view_logs ;;
+    6) uninstall_bot ;;
+    0) exit 0 ;;
+    *) echo "无效输入" ;;
+esac
