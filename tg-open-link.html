@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>跳转支付页</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #eef4ff;
+      --panel: rgba(255, 255, 255, 0.92);
+      --text: #12203a;
+      --muted: #5d6c87;
+      --primary: linear-gradient(135deg, #1e4cff 0%, #2d7dff 100%);
+      --primary-shadow: 0 18px 40px rgba(38, 89, 255, 0.28);
+      --border: rgba(34, 71, 158, 0.1);
+      --accent: #eff5ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(65, 123, 255, 0.24), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(39, 180, 255, 0.18), transparent 28%),
+        var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .shell {
+      width: min(100%, 440px);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      overflow: hidden;
+      box-shadow: 0 24px 70px rgba(18, 32, 58, 0.12);
+      backdrop-filter: blur(18px);
+    }
+
+    .hero {
+      padding: 28px 28px 22px;
+      background: linear-gradient(160deg, #19316f 0%, #2450d2 52%, #2d7dff 100%);
+      color: #fff;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      opacity: 0.72;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 30px;
+      line-height: 1.15;
+      font-weight: 800;
+    }
+
+    .hero p {
+      margin: 0;
+      font-size: 15px;
+      line-height: 1.7;
+      color: rgba(255, 255, 255, 0.86);
+    }
+
+    .content {
+      padding: 24px 24px 26px;
+    }
+
+    .card {
+      background: var(--accent);
+      border: 1px solid rgba(54, 116, 255, 0.12);
+      border-radius: 22px;
+      padding: 18px 18px 16px;
+      margin-bottom: 18px;
+    }
+
+    .card-title {
+      margin: 0 0 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #24418d;
+    }
+
+    .card p {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.75;
+      color: var(--muted);
+    }
+
+    .cta {
+      display: block;
+      width: 100%;
+      border: 0;
+      border-radius: 18px;
+      padding: 18px 20px;
+      font-size: 17px;
+      font-weight: 800;
+      color: #fff;
+      background: var(--primary);
+      box-shadow: var(--primary-shadow);
+      cursor: pointer;
+      transition: transform .18s ease, box-shadow .18s ease, opacity .18s ease;
+    }
+
+    .cta:active {
+      transform: translateY(1px) scale(0.995);
+      box-shadow: 0 14px 28px rgba(38, 89, 255, 0.22);
+    }
+
+    .secondary {
+      display: block;
+      width: 100%;
+      margin-top: 12px;
+      border: 1px solid rgba(29, 76, 255, 0.15);
+      background: #fff;
+      color: #25418a;
+      border-radius: 16px;
+      padding: 14px 16px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .status {
+      margin-top: 16px;
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--muted);
+      min-height: 46px;
+    }
+
+    .tiny {
+      margin-top: 16px;
+      font-size: 12px;
+      line-height: 1.75;
+      color: #76839d;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <div class="eyebrow">Payment Bridge</div>
+      <h1>跳转支付页</h1>
+      <p>为了避免 Telegram 内建浏览器影响支付宝或微信拉起，支付将从这里转到系统浏览器继续完成。</p>
+    </div>
+    <div class="content">
+      <div class="card">
+        <div class="card-title">操作说明</div>
+        <p>页面会先自动尝试打开系统浏览器。如果没有自动跳转，请点击下方按钮继续。完成支付后，返回 Telegram 即可收到订单支付成功通知。</p>
+      </div>
+
+      <button id="openButton" class="cta" type="button">在系统浏览器中继续支付</button>
+      <button id="copyButton" class="secondary" type="button">复制支付链接</button>
+
+      <div id="status" class="status">正在准备支付链接...</div>
+      <div class="tiny">如果你仍停留在 Telegram 内建浏览器中，请手动点击“在系统浏览器中继续支付”。</div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+      var params = new URLSearchParams(window.location.search);
+      var target = params.get('target') || '';
+      var tradeNo = params.get('trade_no') || '';
+      var statusEl = document.getElementById('status');
+      var openButton = document.getElementById('openButton');
+      var copyButton = document.getElementById('copyButton');
+      var attempted = false;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function setMainButton() {
+        if (!tg || !tg.MainButton) {
+          return;
+        }
+        tg.MainButton.setParams({
+          text: '打开外部浏览器支付',
+          is_visible: true,
+          is_active: true,
+          has_shine_effect: true,
+          color: '#1e4cff',
+          text_color: '#ffffff'
+        });
+        tg.MainButton.onClick(openExternal);
+      }
+
+      function copyLink() {
+        if (!target) {
+          setStatus('当前没有可复制的支付链接。');
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(target).then(function () {
+            setStatus('支付链接已复制，请在 Safari、Chrome 或其他系统浏览器中打开。');
+          }).catch(function () {
+            window.prompt('请复制以下支付链接', target);
+          });
+          return;
+        }
+        window.prompt('请复制以下支付链接', target);
+      }
+
+      function openExternal() {
+        if (!target) {
+          setStatus('支付链接缺失，请返回 Telegram 重新生成。');
+          return;
+        }
+        attempted = true;
+        setStatus('正在尝试打开系统浏览器，请稍候...');
+
+        if (tg && typeof tg.openLink === 'function') {
+          try {
+            tg.openLink(target);
+            setStatus('如果系统浏览器没有自动打开，请再次点击按钮或复制链接手动打开。');
+            return;
+          } catch (error) {
+            setStatus('自动打开失败，请点击按钮重试或复制链接。');
+          }
+        }
+
+        window.location.href = target;
+      }
+
+      if (tg) {
+        tg.ready();
+        tg.expand();
+        setMainButton();
+      }
+
+      openButton.addEventListener('click', openExternal);
+      copyButton.addEventListener('click', copyLink);
+
+      if (!target) {
+        openButton.disabled = true;
+        copyButton.disabled = true;
+        setStatus('没有检测到有效的支付链接，请返回 Telegram 重新发起支付。');
+        return;
+      }
+
+      setStatus(
+        tradeNo
+          ? '订单 ' + tradeNo + ' 已准备好，正在尝试为你打开系统浏览器。'
+          : '支付链接已准备好，正在尝试为你打开系统浏览器。'
+      );
+
+      window.setTimeout(function () {
+        if (!attempted) {
+          openExternal();
+        }
+      }, 260);
+    })();
+  </script>
+</body>
+</html>

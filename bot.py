@@ -1,11 +1,15 @@
 import asyncio
+import base64
 import json
 import logging
 import os
 from pathlib import Path
 import random
+import hmac
+import hashlib
 import smtplib
 import string
+import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -16,13 +20,15 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from html import escape
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import pymysql
+import phpserialize
+import redis as redis_sync
 import redis.asyncio as redis
 import requests
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -41,6 +47,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+_V2BOARD_RUNTIME_CONFIG_CACHE = {"expires_at": 0.0, "data": {}}
+_AUTH_HELPER_FALLBACK_WARNED: set[str] = set()
 
 
 def env_int(name: str, default: int) -> int:
@@ -140,6 +148,17 @@ CHECKIN_BROADCAST_ENABLED = env_bool("CHECKIN_BROADCAST_ENABLED", True)
 CHECKIN_BROADCAST_CHAT_ID = env_int("CHECKIN_BROADCAST_CHAT_ID", 0)
 CHECKIN_BROADCAST_PRIVATE_SYNC = env_bool("CHECKIN_BROADCAST_PRIVATE_SYNC", True)
 CHECKIN_BROADCAST_GROUP_SYNC = env_bool("CHECKIN_BROADCAST_GROUP_SYNC", True)
+GROUP_HOURLY_PUSH_ENABLED = env_bool("GROUP_HOURLY_PUSH_ENABLED", False)
+GROUP_HOURLY_PUSH_CHAT_ID = env_int("GROUP_HOURLY_PUSH_CHAT_ID", CHECKIN_BROADCAST_CHAT_ID)
+GROUP_HOURLY_PUSH_INTERVAL_MINUTES = max(10, env_int("GROUP_HOURLY_PUSH_INTERVAL_MINUTES", 60))
+GROUP_HOURLY_PUSH_ANCHOR_MINUTE = max(0, min(env_int("GROUP_HOURLY_PUSH_ANCHOR_MINUTE", 0), 59))
+GROUP_HOURLY_PUSH_TEXT = (os.getenv("GROUP_HOURLY_PUSH_TEXT") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_1_TEXT = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_1_TEXT") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_1_URL = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_1_URL") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_2_TEXT = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_2_TEXT") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_2_URL = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_2_URL") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_3_TEXT = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_3_TEXT") or "").strip()
+GROUP_HOURLY_PUSH_BUTTON_3_URL = (os.getenv("GROUP_HOURLY_PUSH_BUTTON_3_URL") or "").strip()
 
 SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
 SMTP_PORT = env_int("SMTP_PORT", 587)
@@ -273,6 +292,117 @@ def encode_mail_header(value: str) -> str:
 
 def encode_from_header(display_name: str, email: str) -> str:
     return formataddr((str(Header(display_name, "utf-8")), email))
+
+
+def get_payment_webapp_url(pay_url: str, trade_no: str | None = None) -> str:
+    base_url = V2BOARD_DOMAIN.rstrip("/") + "/tg-open-link.html"
+    query = {"target": pay_url, "source": "payment"}
+    if trade_no:
+        query["trade_no"] = trade_no
+    return f"{base_url}?{urlencode(query)}"
+
+
+def get_v2board_project_root() -> str | None:
+    if not V2BOARD_CONFIG_PATH:
+        return None
+
+    path = Path(V2BOARD_CONFIG_PATH)
+    if not path.is_absolute():
+        return None
+
+    parts = [part.lower() for part in path.parts]
+    if len(parts) >= 3 and path.name == "config.php" and path.parent.name == "cache" and path.parent.parent.name == "bootstrap":
+        return str(path.parent.parent.parent)
+    if len(parts) >= 2 and path.name == "v2board.php" and path.parent.name == "config":
+        return str(path.parent.parent)
+    return str(path.parent.parent)
+
+
+def load_v2board_runtime_config_sync(force_refresh: bool = False) -> dict:
+    global _V2BOARD_RUNTIME_CONFIG_CACHE
+
+    now = time.time()
+    if (
+        not force_refresh
+        and _V2BOARD_RUNTIME_CONFIG_CACHE["data"]
+        and _V2BOARD_RUNTIME_CONFIG_CACHE["expires_at"] > now
+    ):
+        return dict(_V2BOARD_RUNTIME_CONFIG_CACHE["data"])
+
+    config_path = Path(V2BOARD_CONFIG_PATH) if V2BOARD_CONFIG_PATH else None
+    if not config_path or not config_path.is_file():
+        return {}
+
+    escaped_config_path = str(config_path).replace("'", "\\'")
+    php_script = f"""
+$cfg = include '{escaped_config_path}';
+echo json_encode([
+    'app_key' => $cfg['app']['key'] ?? null,
+    'cache_prefix' => $cfg['cache']['prefix'] ?? null,
+    'redis_prefix' => $cfg['database']['redis']['options']['prefix'] ?? null,
+    'cache_host' => $cfg['database']['redis']['cache']['host'] ?? null,
+    'cache_port' => $cfg['database']['redis']['cache']['port'] ?? null,
+    'cache_password' => $cfg['database']['redis']['cache']['password'] ?? null,
+    'cache_db' => $cfg['database']['redis']['cache']['database'] ?? null,
+    'default_host' => $cfg['database']['redis']['default']['host'] ?? null,
+    'default_port' => $cfg['database']['redis']['default']['port'] ?? null,
+    'default_password' => $cfg['database']['redis']['default']['password'] ?? null
+], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+"""
+
+    try:
+        result = subprocess.run(
+            ["php", "-r", php_script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            _V2BOARD_RUNTIME_CONFIG_CACHE = {
+                "expires_at": now + 300,
+                "data": data,
+            }
+            return dict(data)
+        logger.warning("load_v2board_runtime_config_sync php helper failed: %s", result.stderr.strip())
+    except Exception:
+        logger.exception("load_v2board_runtime_config_sync php helper exception")
+
+    return {}
+
+
+def resolve_redis_socket_path(socket_path: str) -> str | None:
+    if not socket_path:
+        return None
+
+    direct_path = Path(socket_path)
+    if direct_path.exists():
+        return str(direct_path)
+
+    socket_suffix = socket_path.lstrip("/")
+    proc_root = Path("/proc")
+    with suppress(Exception):
+        for proc_entry in proc_root.iterdir():
+            if not proc_entry.name.isdigit():
+                continue
+            candidate = proc_entry / "root" / socket_suffix
+            with suppress(Exception):
+                if candidate.exists():
+                    return str(candidate)
+    return None
+
+
+def base64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def jwt_encode_hs256(payload: dict, secret: bytes) -> str:
+    header = {"typ": "JWT", "alg": "HS256"}
+    header_b64 = base64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = base64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    signature = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    return f"{header_b64}.{payload_b64}.{base64url_encode(signature)}"
 
 
 def is_admin_telegram_id(telegram_id: int | None) -> bool:
@@ -852,12 +982,143 @@ class DataManager:
         return await cls.run_db(_migrate)
 
     @staticmethod
-    def call_checkout_api(trade_no: str, method_id: int, token: str):
-        url = f"{V2BOARD_DOMAIN}/api/v1/user/order/checkout"
-        payload = {"trade_no": trade_no, "method": method_id}
-        headers = {"Authorization": token, "User-Agent": "V2BoardBot/2.0"}
+    def generate_auth_data(user_id: int):
+        global _AUTH_HELPER_FALLBACK_WARNED
+        project_root = get_v2board_project_root()
+        if project_root:
+            php_script = f"""
+require '{project_root}/vendor/autoload.php';
+$app = require '{project_root}/bootstrap/app.php';
+$kernel = $app->make(Illuminate\\Contracts\\Console\\Kernel::class);
+$kernel->bootstrap();
+$user = App\\Models\\User::find({int(user_id)});
+if (!$user) {{
+    fwrite(STDERR, 'USER_NOT_FOUND');
+    exit(1);
+}}
+$request = Illuminate\\Http\\Request::create('/', 'POST', []);
+$request->server->set('REMOTE_ADDR', '127.0.0.1');
+$request->headers->set('User-Agent', 'V2BoardBot/2.0');
+$authService = new App\\Services\\AuthService($user);
+$data = $authService->generateAuthData($request);
+echo $data['auth_data'];
+"""
+            try:
+                result = subprocess.run(
+                    ["php", "-r", php_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+                warn_key = project_root or "default"
+                if warn_key not in _AUTH_HELPER_FALLBACK_WARNED:
+                    logger.warning(
+                        "generate_auth_data php helper unavailable, fallback mode enabled for %s",
+                        project_root,
+                    )
+                    _AUTH_HELPER_FALLBACK_WARNED.add(warn_key)
+                logger.debug("generate_auth_data php helper stderr: %s", result.stderr.strip())
+            except Exception:
+                logger.exception("generate_auth_data php helper exception for user_id=%s", user_id)
+
+        return DataManager.generate_auth_data_fallback(user_id)
+
+    @staticmethod
+    def generate_auth_data_fallback(user_id: int):
         try:
-            response = requests.post(url, data=payload, headers=headers, timeout=10)
+            runtime_config = load_v2board_runtime_config_sync()
+            app_key = runtime_config.get("app_key")
+            cache_prefix = runtime_config.get("cache_prefix") or "v2board_cache"
+            redis_prefix = runtime_config.get("redis_prefix") or "v2board_database_"
+            cache_db = safe_int(runtime_config.get("cache_db")) or 1
+            cache_host = (
+                runtime_config.get("cache_host")
+                or runtime_config.get("default_host")
+                or "127.0.0.1"
+            )
+            cache_password = (
+                runtime_config.get("cache_password")
+                if runtime_config.get("cache_password") is not None
+                else runtime_config.get("default_password") or ""
+            )
+            cache_port = safe_int(runtime_config.get("cache_port")) or safe_int(runtime_config.get("default_port")) or 6379
+            if not app_key:
+                return None
+
+            session_guid = uuid.uuid4().hex
+            auth_data = jwt_encode_hs256(
+                {"id": int(user_id), "session": session_guid},
+                app_key.encode("utf-8"),
+            )
+            if str(cache_host).startswith("/"):
+                resolved_socket = resolve_redis_socket_path(str(cache_host))
+                if resolved_socket:
+                    redis_client_sync = redis_sync.Redis(
+                        unix_socket_path=resolved_socket,
+                        db=cache_db,
+                        password=cache_password or None,
+                        decode_responses=False,
+                    )
+                else:
+                    redis_url = REDIS_URL.rsplit("/", 1)[0] + f"/{cache_db}" if "/" in REDIS_URL else REDIS_URL
+                    redis_client_sync = redis_sync.from_url(
+                        redis_url,
+                        password=cache_password or None,
+                        decode_responses=False,
+                    )
+            else:
+                redis_client_sync = redis_sync.Redis(
+                    host=cache_host,
+                    port=cache_port,
+                    db=cache_db,
+                    password=cache_password or None,
+                    decode_responses=False,
+                )
+            session_key = f"{redis_prefix}{cache_prefix}:USER_SESSIONS_{int(user_id)}"
+
+            existing = redis_client_sync.get(session_key)
+            sessions = phpserialize.loads(existing, decode_strings=True) if existing else {}
+            sessions[session_guid] = {
+                "ip": "127.0.0.1",
+                "login_at": int(time.time()),
+                "ua": "V2BoardBot/2.0",
+                "auth_data": auth_data,
+            }
+            redis_client_sync.set(session_key, phpserialize.dumps(sessions, charset="utf-8"))
+            return auth_data
+        except Exception:
+            logger.exception("generate_auth_data_fallback failed for user_id=%s", user_id)
+            return None
+
+    @staticmethod
+    def get_quick_login_url(auth_data: str, redirect: str):
+        try:
+            response = requests.post(
+                f"{V2BOARD_DOMAIN}/api/v1/user/getQuickLoginUrl",
+                headers=api_headers(),
+                json={"auth_data": auth_data, "redirect": redirect},
+                timeout=15,
+            )
+            body = parse_api_response(response)
+            if response.status_code >= 400:
+                raise RuntimeError(body.get("message") or f"HTTP {response.status_code}")
+            return body.get("data")
+        except Exception:
+            logger.exception("get_quick_login_url failed for redirect=%s", redirect)
+            return None
+
+    @staticmethod
+    def call_checkout_api(trade_no: str, method_id: int, user_id: int):
+        auth_data = DataManager.generate_auth_data(user_id)
+        if not auth_data:
+            return None
+
+        url = f"{V2BOARD_DOMAIN}/api/v1/user/order/checkout"
+        payload = {"trade_no": trade_no, "method": method_id, "auth_data": auth_data}
+        try:
+            response = requests.post(url, headers=api_headers(), json=payload, timeout=15)
             response.raise_for_status()
             body = response.json()
             data = body.get("data")
@@ -870,7 +1131,7 @@ class DataManager:
             logger.warning("Unexpected checkout response for %s: %s", trade_no, body)
         except Exception:
             logger.exception("Checkout API failed for %s", trade_no)
-        return None
+        return DataManager.get_quick_login_url(auth_data, f"order/{trade_no}")
 
     @classmethod
     async def get_order_statuses(cls, trade_nos):
@@ -1726,6 +1987,20 @@ async def fetch_site_download_config():
     return config_data
 
 
+async def fetch_v2board_runtime_config():
+    cache_key = "v2bot:cache:v2board_runtime_config"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            await redis_client.delete(cache_key)
+
+    config_data = await DataManager.run_db(load_v2board_runtime_config_sync)
+    await redis_client.set(cache_key, json.dumps(config_data, ensure_ascii=False), ex=300)
+    return config_data
+
+
 async def send_register_email_verify(email: str):
     def _request():
         url = f"{V2BOARD_DOMAIN}/api/v1/passport/comm/sendEmailVerify"
@@ -2090,6 +2365,65 @@ async def maybe_broadcast_checkin(
         )
 
 
+def get_group_hourly_push_slot(now_dt: datetime | None = None) -> str | None:
+    now_dt = now_dt or datetime.now()
+    minutes_today = now_dt.hour * 60 + now_dt.minute
+    if minutes_today < GROUP_HOURLY_PUSH_ANCHOR_MINUTE:
+        return None
+    slot_index = (minutes_today - GROUP_HOURLY_PUSH_ANCHOR_MINUTE) // GROUP_HOURLY_PUSH_INTERVAL_MINUTES
+    return f"{now_dt.strftime('%Y%m%d')}:{slot_index}"
+
+
+async def build_group_hourly_push_payload(bot) -> tuple[str, InlineKeyboardMarkup | None]:
+    bot_username = getattr(bot, "username", None)
+    if not bot_username:
+        with suppress(Exception):
+            me = await bot.get_me()
+            bot_username = me.username
+
+    bot_url = f"https://t.me/{bot_username}?start=menu" if bot_username else ""
+
+    text = GROUP_HOURLY_PUSH_TEXT or (
+        f"🌟 <b>{escape(SITE_NAME)} 官方助手</b>\n\n"
+        "点击下方按钮即可打开机器人。\n"
+        "注册账号、绑定邮箱、购买套餐、查看订阅、APP 下载、每日签到，都可以直接在机器人里完成。"
+    )
+
+    custom_buttons = any(
+        [
+            GROUP_HOURLY_PUSH_BUTTON_1_TEXT,
+            GROUP_HOURLY_PUSH_BUTTON_1_URL,
+            GROUP_HOURLY_PUSH_BUTTON_2_TEXT,
+            GROUP_HOURLY_PUSH_BUTTON_2_URL,
+            GROUP_HOURLY_PUSH_BUTTON_3_TEXT,
+            GROUP_HOURLY_PUSH_BUTTON_3_URL,
+        ]
+    )
+
+    if custom_buttons:
+        button_specs = [
+            (GROUP_HOURLY_PUSH_BUTTON_1_TEXT, GROUP_HOURLY_PUSH_BUTTON_1_URL),
+            (GROUP_HOURLY_PUSH_BUTTON_2_TEXT, GROUP_HOURLY_PUSH_BUTTON_2_URL),
+            (GROUP_HOURLY_PUSH_BUTTON_3_TEXT, GROUP_HOURLY_PUSH_BUTTON_3_URL),
+        ]
+    else:
+        button_specs = [("🤖 打开机器人", bot_url)]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for label, url in button_specs:
+        if not label or not url:
+            continue
+        current_row.append(InlineKeyboardButton(label, url=url))
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+
+    return text, InlineKeyboardMarkup(rows) if rows else None
+
+
 async def render_invite_text(user_id: int) -> str:
     summary = await DataManager.get_invite_summary(user_id)
     invite_codes = await DataManager.get_invite_codes(user_id)
@@ -2412,23 +2746,34 @@ async def render_plan_detail(plan_id: int):
 async def show_payment_methods(query, trade_no: str, total_amount) -> None:
     methods = await DataManager.get_payment_methods()
     if not methods:
-        await query.edit_message_text("当前没有可用的支付方式，请稍后再试。")
+        await query.edit_message_text(
+            "当前没有可用的支付方式，请稍后再试。",
+            reply_markup=build_menu_footer(),
+        )
         return
 
     keyboard = []
     for method in methods:
-        keyboard.append([InlineKeyboardButton(str(method.get("name") or "支付方式"), callback_data=f"pay:{trade_no}:{method['id']}")])
-    keyboard.append([InlineKeyboardButton("取消订单", callback_data=f"cancel:{trade_no}")])
+        method_name = str(method.get("name") or "支付方式")
+        keyboard.append([InlineKeyboardButton(method_name, callback_data=f"pay:{trade_no}:{method['id']}")])
+    keyboard.append(
+        [
+            InlineKeyboardButton("取消订单", callback_data=f"cancel:{trade_no}"),
+            InlineKeyboardButton("返回订单", callback_data="menu_orders"),
+        ]
+    )
 
     await query.edit_message_text(
         (
-            "💳 <b>选择支付方式</b>\n"
-            f"订单号: <code>{escape(trade_no)}</code>\n"
-            f"金额: {format_money(total_amount)}\n\n"
-            "请选择要使用的支付渠道。"
+            "💳 <b>选择支付方式</b>\n\n"
+            f"订单号：<code>{escape(trade_no)}</code>\n"
+            f"订单金额：{format_money(total_amount)}\n\n"
+            "请选择要使用的支付渠道。\n"
+            "点击后会直接跳转到收银台或支付页，无需再次登录网站。\n"
+            "支付完成后，机器人会自动通知你。"
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=build_menu_footer(keyboard),
     )
 
 
@@ -2716,19 +3061,23 @@ async def process_unpaid_recalls(bot) -> None:
             ):
                 continue
 
-            keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("继续支付", callback_data=f"repay:{order['trade_no']}")]]
+            keyboard = build_menu_footer(
+                [
+                    [InlineKeyboardButton("继续支付", callback_data=f"repay:{order['trade_no']}")],
+                    [InlineKeyboardButton("查看订单", callback_data="menu_orders")],
+                ]
             )
             sent = False
             with suppress(Exception):
                 await bot.send_message(
                     safe_int(order["telegram_id"]),
                     (
-                        "🧾 <b>你有一笔待支付订单</b>\n"
+                        "🧾 <b>你有一笔待支付订单</b>\n\n"
                         f"订单号：<code>{escape(str(order.get('trade_no') or ''))}</code>\n"
-                        f"金额：{format_money(order.get('total_amount'))}\n"
-                        f"已等待：{age_minutes} 分钟\n"
-                        "如果仍需要该订单，可以直接继续支付。"
+                        f"订单金额：{format_money(order.get('total_amount'))}\n"
+                        f"已等待：{age_minutes} 分钟\n\n"
+                        "如果你仍需要这笔订单，可直接继续支付。\n"
+                        "支付完成后，机器人会自动通知你。"
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
@@ -3229,10 +3578,16 @@ async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     items = await DataManager.get_orders(user["id"])
     if not items:
-        await update.effective_message.reply_text("暂时没有订单记录。")
+        await update.effective_message.reply_text("暂时没有订单记录。", reply_markup=build_menu_footer())
         return
 
-    lines = ["🧾 <b>最近订单</b>", ""]
+    lines = [
+        "🧾 <b>最近订单</b>",
+        "",
+        "这里会显示你最近的订单状态。",
+        "如果有待支付订单，可直接继续支付或取消。",
+        "",
+    ]
     keyboard = []
     pending_order = None
 
@@ -3692,7 +4047,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             DataManager.call_checkout_api,
             trade_no,
             method_id,
-            str(user.get("token") or ""),
+            safe_int(user.get("id")),
         )
         if not pay_url:
             pay_url = f"{V2BOARD_DOMAIN}/#/order/{trade_no}"
@@ -3700,18 +4055,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await redis_client.sadd("v2bot:pending_orders", trade_no)
         await redis_client.set(f"v2bot:order_owner:{trade_no}", update.effective_user.id, ex=7200)
 
-        keyboard = InlineKeyboardMarkup(
+        payment_webapp_url = get_payment_webapp_url(pay_url, trade_no)
+        keyboard = build_menu_footer(
             [
-                [InlineKeyboardButton("立即支付", url=pay_url)],
-                [InlineKeyboardButton("返回套餐列表", callback_data="back_shop")],
+                [InlineKeyboardButton("立即支付", web_app=WebAppInfo(url=payment_webapp_url))],
+                [InlineKeyboardButton("查看订单", callback_data="menu_orders")],
             ]
         )
         await query.edit_message_text(
             (
                 "💰 <b>支付链接已生成</b>\n\n"
-                f"订单号: <code>{escape(trade_no)}</code>\n"
-                f"金额: {format_money(order.get('total_amount'))}\n\n"
-                "完成支付后，机器人会自动通知你。"
+                f"订单号：<code>{escape(trade_no)}</code>\n"
+                f"订单金额：{format_money(order.get('total_amount'))}\n\n"
+                "点击下方按钮后，会先打开支付中转页，再自动跳到系统浏览器中的收银台。\n"
+                "这样可以避开 Telegram 内建浏览器对支付宝/微信拉起的兼容问题。\n"
+                "整个过程中无需再次登录网站。\n"
+                "支付完成后，机器人会自动通知你。"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
@@ -3976,11 +4335,19 @@ async def payment_monitor(bot) -> None:
                                 await bot.send_message(
                                     safe_int(tg_id),
                                     (
-                                        "✅ <b>订单已支付</b>\n"
-                                        f"订单号: <code>{escape(trade_no)}</code>\n"
-                                        f"金额: {format_money(order.get('total_amount'))}"
+                                        "✅ <b>订单已支付</b>\n\n"
+                                        f"订单号：<code>{escape(trade_no)}</code>\n"
+                                        f"支付金额：{format_money(order.get('total_amount'))}\n\n"
+                                        "款项已到账，你现在可以继续使用服务。\n"
+                                        "如需查看订阅、订单或返回首页，可直接使用下方入口。"
                                     ),
                                     parse_mode=ParseMode.HTML,
+                                    reply_markup=build_menu_footer(
+                                        [
+                                            [InlineKeyboardButton("订阅链接", callback_data="menu_sub")],
+                                            [InlineKeyboardButton("我的订单", callback_data="menu_orders")],
+                                        ]
+                                    ),
                                 )
                         await redis_client.srem("v2bot:pending_orders", trade_no)
                         await redis_client.delete(f"v2bot:order_owner:{trade_no}")
@@ -4002,6 +4369,7 @@ async def retention_monitor(bot) -> None:
             await process_traffic_alerts(bot)
             await process_unpaid_recalls(bot)
             await process_commission_notifications(bot)
+            await process_group_hourly_push(bot)
             await process_admin_aff_reports(bot)
         except asyncio.CancelledError:
             raise
@@ -4057,6 +4425,48 @@ async def process_admin_aff_reports(bot) -> None:
                     notice_key=weekly_notice_key,
                     payload={"week_scope": weekly_key},
                 )
+
+
+async def process_group_hourly_push(bot) -> None:
+    if not GROUP_HOURLY_PUSH_ENABLED or not GROUP_HOURLY_PUSH_CHAT_ID:
+        return
+
+    slot_key = get_group_hourly_push_slot()
+    if not slot_key:
+        return
+
+    notice_key = f"{GROUP_HOURLY_PUSH_CHAT_ID}:{slot_key}"
+    if await DataManager.get_last_notice_time(0, "group_hourly_push", notice_key):
+        return
+
+    text, keyboard = await build_group_hourly_push_payload(bot)
+    last_message_key = f"v2bot:group_hourly_push:last_message:{GROUP_HOURLY_PUSH_CHAT_ID}"
+    previous_message_id = safe_int(await redis_client.get(last_message_key))
+    sent = False
+    sent_message = None
+    with suppress(Exception):
+        sent_message = await bot.send_message(
+            GROUP_HOURLY_PUSH_CHAT_ID,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        sent = True
+
+    if sent:
+        if previous_message_id > 0 and sent_message and previous_message_id != safe_int(sent_message.message_id):
+            with suppress(Exception):
+                await bot.delete_message(GROUP_HOURLY_PUSH_CHAT_ID, previous_message_id)
+        if sent_message:
+            await redis_client.set(last_message_key, sent_message.message_id)
+        await DataManager.record_notice_if_new(
+            user_id=0,
+            telegram_id=GROUP_HOURLY_PUSH_CHAT_ID,
+            notice_type="group_hourly_push",
+            notice_key=notice_key,
+            payload={"slot": slot_key},
+        )
 
 
 async def close_redis() -> None:
