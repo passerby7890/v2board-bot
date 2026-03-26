@@ -1,544 +1,309 @@
 #!/bin/bash
 
-# =================配置区域=================
-WORK_DIR="/root/v2bot"
-SERVICE_NAME="v2bot"
-ENV_FILE="$WORK_DIR/.env"
-# =========================================
+set -euo pipefail
+
+WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVICE_NAME="${SERVICE_NAME:-v2bot}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}错误：请使用 root 用户运行此脚本！${PLAIN}"
-   exit 1
-fi
-
-# 1. 安装系统环境
-function install_env() {
-    echo -e "${YELLOW}>>> [1/4] 正在检查系统环境...${PLAIN}"
-    systemctl stop $SERVICE_NAME >/dev/null 2>&1
-
-    if [[ -f /etc/redhat-release ]]; then
-        if ! command -v python3 &>/dev/null; then yum -y install python3 python3-pip; fi
-        if ! command -v redis-server &>/dev/null; then yum -y install redis; systemctl enable --now redis; fi
-        if ! command -v wget &>/dev/null; then yum -y install wget; fi
-    elif [[ -f /etc/debian_version ]]; then
-        apt-get update -y >/dev/null
-        if ! command -v python3 &>/dev/null; then apt-get -y install python3 python3-pip python3-venv; fi
-        if ! command -v redis-server &>/dev/null; then apt-get -y install redis-server; systemctl enable --now redis-server; fi
-        if ! command -v wget &>/dev/null; then apt-get -y install wget; fi
-    fi
-
-    mkdir -p $WORK_DIR
-    cd $WORK_DIR
+print_info() {
+    echo -e "${YELLOW}$1${PLAIN}"
 }
 
-# 2. 智能配置管理
-function manage_config() {
-    echo -e "${YELLOW}>>> [2/4] 正在处理配置文件...${PLAIN}"
+print_ok() {
+    echo -e "${GREEN}$1${PLAIN}"
+}
 
-    check_add_env() {
-        local key=$1
-        local val=$2
-        if ! grep -q "^${key}=" "$ENV_FILE"; then
-            echo "${key}=${val}" >> "$ENV_FILE"
-            echo -e "${GREEN}  + 自动补全参数: ${key}=${val}${PLAIN}"
-        fi
-    }
+print_error() {
+    echo -e "${RED}$1${PLAIN}"
+}
 
-    if [ -f "$ENV_FILE" ]; then
-        echo -e "${GREEN}  ✓ 检测到现有配置，正在增量检查...${PLAIN}"
-        check_add_env "CHECKIN_MIN" "100"
-        check_add_env "CHECKIN_MAX" "500"
-        check_add_env "CRIT_RATE" "0.1"
-        check_add_env "CRIT_MULT" "1.5"
-        check_add_env "DB_TABLE_PREFIX" "v2_"
-        check_add_env "REDIS_URL" "redis://localhost:6379/0"
-        echo -e "${GREEN}  ✓ 配置检查完毕。${PLAIN}"
+ensure_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        print_error "请使用 root 运行此脚本。"
+        exit 1
+    fi
+}
+
+install_system_packages() {
+    print_info ">>> 安装系统依赖"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y
+        apt-get install -y python3 python3-pip python3-venv redis-server
+        systemctl enable --now redis-server
+    elif command -v yum >/dev/null 2>&1; then
+        yum -y install python3 python3-pip redis
+        systemctl enable --now redis
     else
-        echo -e "${YELLOW}  ! 未检测到配置，开始全新引导...${PLAIN}"
-        read -p "请输入 Bot Token: " input_token
-        read -p "请输入 网站域名 (如 https://vpn.com): " input_domain
-        read -p "数据库地址 (默认 127.0.0.1): " input_db_host
-        input_db_host=${input_db_host:-127.0.0.1}
-        read -p "数据库名 (默认 v2board): " input_db_name
-        input_db_name=${input_db_name:-v2board}
-        read -p "数据库用户 (默认 root): " input_db_user
-        input_db_user=${input_db_user:-root}
-        read -p "请输入 数据库密码: " input_db_pass
-        
-        input_domain=${input_domain%/}
-        
-        cat > "$ENV_FILE" <<EOF
-BOT_TOKEN=$input_token
-V2BOARD_DOMAIN=$input_domain
-DB_HOST=$input_db_host
-DB_PORT=3306
-DB_DATABASE=$input_db_name
-DB_USERNAME=$input_db_user
-DB_PASSWORD=$input_db_pass
+        print_error "不支持的系统，请手动安装 Python 3、pip 和 Redis。"
+        exit 1
+    fi
+}
+
+setup_virtualenv() {
+    print_info ">>> 建立虚拟环境并安装依赖"
+    cd "${WORK_DIR}"
+
+    if [[ ! -d "venv" ]]; then
+        python3 -m venv venv
+    fi
+
+    ./venv/bin/pip install --upgrade pip
+    ./venv/bin/pip install -r requirements.txt
+}
+
+ensure_env_file() {
+    cd "${WORK_DIR}"
+
+    if [[ -f ".env" ]]; then
+        return
+    fi
+
+    print_info ">>> 未检测到 .env，准备生成配置文件"
+
+    read -r -p "Bot Token: " input_token
+    read -r -p "网站名称 [Duty123 用户中心]: " input_site_name
+    read -r -p "V2Board 域名 (示例 https://example.com): " input_domain
+    read -r -p "数据库主机 [127.0.0.1]: " input_db_host
+    read -r -p "数据库端口 [3306]: " input_db_port
+    read -r -p "数据库名称: " input_db_name
+    read -r -p "数据库账号: " input_db_user
+    read -r -p "数据库密码: " input_db_pass
+    read -r -p "Redis 地址 [redis://localhost:6379/0]: " input_redis_url
+    read -r -p "SMTP 主机: " input_smtp_host
+    read -r -p "SMTP 端口 [465]: " input_smtp_port
+    read -r -p "SMTP 用户名: " input_smtp_user
+    read -r -p "SMTP 密码: " input_smtp_pass
+    read -r -p "发件地址: " input_smtp_from
+    read -r -p "发件显示名称 [跟网站名称一致]: " input_smtp_from_name
+
+    input_site_name="${input_site_name:-Duty123 用户中心}"
+    input_db_host="${input_db_host:-127.0.0.1}"
+    input_db_port="${input_db_port:-3306}"
+    input_redis_url="${input_redis_url:-redis://localhost:6379/0}"
+    input_smtp_port="${input_smtp_port:-465}"
+    input_domain="${input_domain%/}"
+    input_smtp_from_name="${input_smtp_from_name:-$input_site_name}"
+
+    cat > .env <<EOF
+# --------------------------------------------------
+# Telegram Bot 基本设置
+# BOT_TOKEN: Telegram BotFather 提供的机器人 Token
+# SITE_NAME: 对外显示的网站名称，会用于邮件标题与模板
+# V2BOARD_DOMAIN: V2Board 主站网址，不要带最后的 /
+# --------------------------------------------------
+BOT_TOKEN=${input_token}
+SITE_NAME=${input_site_name}
+V2BOARD_DOMAIN=${input_domain}
+
+# --------------------------------------------------
+# MySQL 数据库设置
+# DB_HOST: 数据库主机
+# DB_PORT: 数据库端口，MySQL 默认 3306
+# DB_DATABASE: V2Board 使用的数据库名称
+# DB_USERNAME: 数据库用户名
+# DB_PASSWORD: 数据库密码
+# DB_TABLE_PREFIX: V2Board 数据表前缀，常见为 v2_
+# --------------------------------------------------
+DB_HOST=${input_db_host}
+DB_PORT=${input_db_port}
+DB_DATABASE=${input_db_name}
+DB_USERNAME=${input_db_user}
+DB_PASSWORD=${input_db_pass}
 DB_TABLE_PREFIX=v2_
-REDIS_URL=redis://localhost:6379/0
+
+# --------------------------------------------------
+# Redis 设置
+# REDIS_URL: Redis 连接字符串，用来存绑定验证码、签到状态、订单轮询数据
+# --------------------------------------------------
+REDIS_URL=${input_redis_url}
+
+# --------------------------------------------------
+# 签到与提醒设置
+# CHECKIN_MIN: 每日签到最小奖励，单位 MB
+# CHECKIN_MAX: 每日签到最大奖励，单位 MB
+# CRIT_RATE: 暴击概率，0.1 代表 10%
+# CRIT_MULT: 暴击倍数
+# PAYMENT_POLL_INTERVAL: 订单轮询间隔，单位秒
+# RETENTION_POLL_INTERVAL: 粘性提醒巡检间隔，单位秒
+# EXPIRE_REMIND_DAYS: 到期提醒天数，逗号分隔
+# TRAFFIC_ALERT_THRESHOLDS: 流量提醒百分比阈值，逗号分隔
+# UNPAID_RECALL_MINUTES: 未付款召回提醒分钟数，逗号分隔
+# EMAIL_NOTIFY_EXPIRE_DAYS: 哪些到期提醒要额外发送 Email，逗号分隔
+# EMAIL_NOTIFY_TRAFFIC_THRESHOLDS: 哪些流量提醒要额外发送 Email，逗号分隔
+# EMAIL_NOTIFY_UNPAID_MINUTES: 哪些未付款召回要额外发送 Email，逗号分隔
+# QUIET_HOURS_START: 静默时段开始小时，24 小时制
+# QUIET_HOURS_END: 静默时段结束小时，24 小时制
+# EXPIRE_REMINDER_COOLDOWN_MINUTES: 到期提醒冷却时间，单位分钟
+# TRAFFIC_ALERT_COOLDOWN_MINUTES: 流量提醒冷却时间，单位分钟
+# UNPAID_RECALL_COOLDOWN_MINUTES: 未付款召回冷却时间，单位分钟
+# COMMISSION_NOTICE_COOLDOWN_MINUTES: 返利通知冷却时间，单位分钟
+# COMMISSION_EMAIL_MIN_AMOUNT: 返利达到多少金额时额外发送 Email，单位分
+# COMMISSION_EMAIL_MIN_ORDER_AMOUNT: 关联订单达到多少金额时额外发送 Email，单位分
+# ADMIN_TELEGRAM_IDS: 管理员 Telegram ID 列表，逗号分隔
+# ADMIN_REPORT_HOUR: 管理员日报/周报推送小时
+# ADMIN_REPORT_MINUTE: 管理员日报/周报推送分钟
+# ADMIN_WEEKLY_REPORT_WEEKDAY: 管理员周报推送星期，0=周一
+# AFF_RANK_LIMIT: AFF 排行榜显示数量
+# INVITE_CODE_STATS_LIMIT: 邀请码统计显示数量
+# --------------------------------------------------
 CHECKIN_MIN=100
-CHECKIN_MAX=500
+CHECKIN_MAX=250
 CRIT_RATE=0.1
 CRIT_MULT=1.5
+PAYMENT_POLL_INTERVAL=15
+RETENTION_POLL_INTERVAL=300
+EXPIRE_REMIND_DAYS=7,3,1,0
+TRAFFIC_ALERT_THRESHOLDS=70,85,95
+UNPAID_RECALL_MINUTES=10,60,1440
+EMAIL_NOTIFY_EXPIRE_DAYS=1,0
+EMAIL_NOTIFY_TRAFFIC_THRESHOLDS=95
+EMAIL_NOTIFY_UNPAID_MINUTES=1440
+QUIET_HOURS_START=0
+QUIET_HOURS_END=8
+EXPIRE_REMINDER_COOLDOWN_MINUTES=720
+TRAFFIC_ALERT_COOLDOWN_MINUTES=1440
+UNPAID_RECALL_COOLDOWN_MINUTES=180
+COMMISSION_NOTICE_COOLDOWN_MINUTES=0
+COMMISSION_EMAIL_MIN_AMOUNT=1000
+COMMISSION_EMAIL_MIN_ORDER_AMOUNT=5000
+ADMIN_TELEGRAM_IDS=
+ADMIN_REPORT_HOUR=23
+ADMIN_REPORT_MINUTE=59
+ADMIN_WEEKLY_REPORT_WEEKDAY=0
+AFF_RANK_LIMIT=10
+INVITE_CODE_STATS_LIMIT=10
+
+# --------------------------------------------------
+# Telegram 绑定验证设置
+# BIND_CODE_TTL: 验证码有效时间，单位秒
+# BIND_MAX_ATTEMPTS: 验证码最多可输错次数
+# BIND_SEND_COOLDOWN_SECONDS: 同一 Telegram / 邮箱再次发送验证码的冷却时间，单位秒
+# --------------------------------------------------
+BIND_CODE_TTL=300
+BIND_MAX_ATTEMPTS=5
+BIND_SEND_COOLDOWN_SECONDS=60
+
+# --------------------------------------------------
+# 任务中心奖励设置
+# TASK_INFO_REWARD_MB: 每日查看账号信息奖励，单位 MB
+# TASK_SHOP_REWARD_MB: 每日浏览套餐列表奖励，单位 MB
+# TASK_SUB_REWARD_MB: 每日查看订阅链接奖励，单位 MB
+# TASK_ORDERS_REWARD_MB: 每日查看订单列表奖励，单位 MB
+# TASK_INVITE_REWARD_MB: 每日查看邀请中心奖励，单位 MB
+# TASK_STREAK_7_REWARD_MB: 连签 7 天额外奖励，单位 MB
+# TASK_STREAK_14_REWARD_MB: 连签 14 天额外奖励，单位 MB
+# TASK_STREAK_30_REWARD_MB: 连签 30 天额外奖励，单位 MB
+# CHECKIN_BROADCAST_ENABLED: 是否开启签到成功群内同步播报，1=开启，0=关闭
+# CHECKIN_BROADCAST_CHAT_ID: 签到播报目标群组 chat_id
+# CHECKIN_BROADCAST_PRIVATE_SYNC: 私聊签到是否同步到群内，1=开启，0=关闭
+# CHECKIN_BROADCAST_GROUP_SYNC: 群内签到是否允许同步到指定群，1=开启，0=关闭
+# --------------------------------------------------
+TASK_INFO_REWARD_MB=20
+TASK_SHOP_REWARD_MB=20
+TASK_SUB_REWARD_MB=20
+TASK_ORDERS_REWARD_MB=20
+TASK_INVITE_REWARD_MB=20
+TASK_STREAK_7_REWARD_MB=128
+TASK_STREAK_14_REWARD_MB=256
+TASK_STREAK_30_REWARD_MB=512
+CHECKIN_BROADCAST_ENABLED=1
+CHECKIN_BROADCAST_CHAT_ID=
+CHECKIN_BROADCAST_PRIVATE_SYNC=1
+CHECKIN_BROADCAST_GROUP_SYNC=1
+
+# --------------------------------------------------
+# SMTP 邮件设置
+# SMTP_HOST: SMTP 服务器地址
+# SMTP_PORT: SMTP 端口，SSL 常见 465，TLS 常见 587
+# SMTP_USERNAME: SMTP 登录账号
+# SMTP_PASSWORD: SMTP 登录密码
+# SMTP_FROM: 实际发件地址
+# SMTP_FROM_NAME: 邮件发件人显示名称
+# SMTP_USE_TLS: 是否使用 STARTTLS，1=开启，0=关闭
+# SMTP_USE_SSL: 是否使用 SSL，1=开启，0=关闭
+# --------------------------------------------------
+SMTP_HOST=${input_smtp_host}
+SMTP_PORT=${input_smtp_port}
+SMTP_USERNAME=${input_smtp_user}
+SMTP_PASSWORD=${input_smtp_pass}
+SMTP_FROM=${input_smtp_from}
+SMTP_FROM_NAME=${input_smtp_from_name}
+SMTP_USE_TLS=0
+SMTP_USE_SSL=1
 EOF
-        echo -e "${GREEN}  ✓ 配置文件已生成。${PLAIN}"
-    fi
+
+    print_ok ">>> .env 已创建"
 }
 
-# 3. 写入 Bot 代码
-function write_bot_code() {
-    echo -e "${YELLOW}>>> [3/4] 正在更新核心代码...${PLAIN}"
-    
-    cat > requirements.txt <<EOF
-python-telegram-bot
-pymysql
-python-dotenv
-redis
-requests
-EOF
+create_service() {
+    print_info ">>> 创建 systemd 服务"
 
-    if [ ! -d "venv" ]; then python3 -m venv venv; fi
-    ./venv/bin/pip install --upgrade pip >/dev/null 2>&1
-    ./venv/bin/pip install -r requirements.txt >/dev/null 2>&1
-
-cat > bot.py << 'EOF'
-import logging, random, pymysql, asyncio, os, string, json, redis.asyncio as redis, requests, traceback, uuid, time
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode, ChatType
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
-
-load_dotenv()
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 环境参数
-BASE_MIN = int(os.getenv("CHECKIN_MIN", 100))
-BASE_MAX = int(os.getenv("CHECKIN_MAX", 500))
-NORMAL_CRIT_RATE = float(os.getenv("CRIT_RATE", 0.1))
-NORMAL_CRIT_MULT = float(os.getenv("CRIT_MULT", 1.5))
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-V2BOARD_DOMAIN = (os.getenv("V2BOARD_DOMAIN") or "").rstrip('/')
-TABLE_PREFIX = os.getenv("DB_TABLE_PREFIX", "v2_")
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "127.0.0.1"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-    "user": os.getenv("DB_USERNAME"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_DATABASE"),
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor
-}
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-TBL_USER, TBL_PLAN, TBL_ORDER, TBL_PAYMENT, TBL_SETTING = [f"{TABLE_PREFIX}{x}" for x in ["user", "plan", "order", "payment", "settings"]]
-executor = ThreadPoolExecutor(max_workers=10)
-
-class DataManager:
-    @staticmethod
-    def get_db_conn(): return pymysql.connect(**DB_CONFIG)
-
-    @classmethod
-    async def get_user_by_email(cls, email):
-        cache_key = f"v2bot:cache:user:{email}"
-        cached = await redis_client.get(cache_key)
-        if cached: return json.loads(cached)
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"SELECT id, email, token, transfer_enable, u, d, plan_id, expired_at FROM {TBL_USER} WHERE email = %s", (email,))
-                    return cur.fetchone()
-        user = await asyncio.get_event_loop().run_in_executor(executor, _q)
-        if user: await redis_client.set(cache_key, json.dumps(user, default=str), ex=30)
-        return user
-
-    @classmethod
-    async def get_plan_name(cls, plan_id):
-        if not plan_id: return "无套餐"
-        cache_key = f"v2bot:cache:plan_name:{plan_id}"
-        cached = await redis_client.get(cache_key)
-        if cached: return cached
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"SELECT name FROM {TBL_PLAN} WHERE id = %s", (plan_id,))
-                    res = cur.fetchone()
-                    return res['name'] if res else "未知套餐"
-        name = await asyncio.get_event_loop().run_in_executor(executor, _q)
-        if name: await redis_client.set(cache_key, name, ex=3600)
-        return name
-
-    @classmethod
-    async def get_active_plans(cls):
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"SELECT id, name, month_price FROM {TBL_PLAN} WHERE `show`=1 AND `renew`=1 ORDER BY sort ASC")
-                    return cur.fetchall()
-        return await asyncio.get_event_loop().run_in_executor(executor, _q)
-
-    @classmethod
-    async def get_payment_methods(cls):
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"SELECT id, name, payment FROM {TBL_PAYMENT} WHERE `enable`=1")
-                    return cur.fetchall()
-        return await asyncio.get_event_loop().run_in_executor(executor, _q)
-
-    @classmethod
-    async def get_pending_order(cls, user_id):
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    sql = f"SELECT trade_no, total_amount, plan_id FROM {TBL_ORDER} WHERE user_id=%s AND status=0 ORDER BY created_at DESC LIMIT 1"
-                    cur.execute(sql, (user_id,))
-                    return cur.fetchone()
-        return await asyncio.get_event_loop().run_in_executor(executor, _q)
-
-    @classmethod
-    async def cancel_order(cls, trade_no, user_id):
-        def _up():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    sql = f"UPDATE {TBL_ORDER} SET status=2 WHERE trade_no=%s AND user_id=%s AND status=0"
-                    cur.execute(sql, (trade_no, user_id)); c.commit()
-        await asyncio.get_event_loop().run_in_executor(executor, _up)
-
-    @classmethod
-    async def create_order(cls, user_id, plan_id, amount, cycle, email):
-        trade_no = ''.join(random.choices(string.ascii_lowercase + string.digits, k=20))
-        now = int(time.time())
-        def _ins():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    sql = f"INSERT INTO {TBL_ORDER} (user_id, plan_id, type, period, trade_no, total_amount, status, created_at, updated_at) VALUES (%s, %s, 1, %s, %s, %s, 0, %s, %s)"
-                    cur.execute(sql, (user_id, plan_id, cycle, trade_no, amount, now, now)); c.commit()
-            return trade_no
-        tn = await asyncio.get_event_loop().run_in_executor(executor, _ins)
-        await redis_client.delete(f"v2bot:cache:user:{email}")
-        return tn
-
-    @classmethod
-    async def add_traffic(cls, uid, flow, email):
-        def _up():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"UPDATE {TBL_USER} SET transfer_enable = transfer_enable + %s WHERE id = %s", (flow, uid)); c.commit()
-        await asyncio.get_event_loop().run_in_executor(executor, _up)
-        await redis_client.delete(f"v2bot:cache:user:{email}")
-
-    @classmethod
-    async def get_orders(cls, uid):
-        def _q():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    cur.execute(f"SELECT trade_no, total_amount, status, created_at FROM {TBL_ORDER} WHERE user_id=%s ORDER BY created_at DESC LIMIT 5", (uid,))
-                    return cur.fetchall()
-        return await asyncio.get_event_loop().run_in_executor(executor, _q)
-
-    @classmethod
-    async def get_sub_domain(cls):
-        cache_key = "v2bot:cache:sub_domains_v8"
-        cached = await redis_client.get(cache_key)
-        if cached:
-            domains = json.loads(cached)
-        else:
-            def _q():
-                with cls.get_db_conn() as c:
-                    with c.cursor() as cur:
-                        cur.execute(f"SELECT `value` FROM {TBL_SETTING} WHERE `name` = 'subscribe_url' LIMIT 1")
-                        return cur.fetchone()
-            try:
-                row = await asyncio.get_event_loop().run_in_executor(executor, _q)
-                if row and row['value']:
-                    domains = [d.strip().rstrip('/') for d in row['value'].split(',') if d.strip()]
-                else:
-                    domains = [V2BOARD_DOMAIN]
-            except: domains = [V2BOARD_DOMAIN]
-            await redis_client.set(cache_key, json.dumps(domains), ex=60)
-        return random.choice(domains)
-
-    @staticmethod
-    def call_checkout_api(trade_no, method_id, token):
-        url = f"{V2BOARD_DOMAIN}/api/v1/user/order/checkout"
-        try:
-            r = requests.post(url, data={"trade_no": trade_no, "method": method_id}, headers={"Authorization": token}, timeout=10)
-            return r.json().get('data')
-        except: return None
-
-    # [安全版] 仅重置 Token/UUID/UpdateAt，不改 Password
-    @classmethod
-    async def reset_security_direct(cls, user_id, email):
-        new_token = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
-        new_uuid = str(uuid.uuid4()); now = int(time.time())
-        def _up():
-            with cls.get_db_conn() as c:
-                with c.cursor() as cur:
-                    sql = f"UPDATE {TBL_USER} SET token=%s, uuid=%s, updated_at=%s WHERE id=%s"
-                    cur.execute(sql, (new_token, new_uuid, now, user_id)); c.commit()
-        await asyncio.get_event_loop().run_in_executor(executor, _up)
-        await redis_client.delete(f"v2bot:cache:user:{email}")
-        return new_token
-
-def safe_int(v):
-    try: return int(float(v or 0))
-    except: return 0
-
-def format_bytes(s):
-    s = float(s or 0); p = 1024; n = 0; l = {0:'', 1:'KB', 2:'MB', 3:'GB', 4:'TB'}
-    while s > p and n < 4: s /= p; n += 1
-    return f"{s:.2f}{l[n]}"
-
-def get_progress_bar(u, t, length=10):
-    try:
-        if not t or float(t) == 0: return "⬜" * length
-        p = min(float(u)/float(t), 1.0); f = int(length * p)
-        return "🟦" * f + "⬜" * (length - f) + f" ({p*100:.1f}%)"
-    except: return "⬜" * length
-
-async def check_priv(u, c):
-    if u.effective_chat.type == ChatType.PRIVATE: return True
-    try:
-        bot_info = await c.bot.get_me()
-        kb = [[InlineKeyboardButton("🔒 点击进入私聊", url=f"https://t.me/{bot_info.username}?start=help")]]
-        msg = await u.message.reply_text("⚠️ <b>此功能涉及隐私，请私聊使用</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-        asyncio.create_task(del_msg(msg, 10))
-        try: await u.message.delete()
-        except: pass
-    except: pass
-    return False
-
-async def del_msg(m, d):
-    await asyncio.sleep(d)
-    try: await m.delete()
-    except: pass
-
-async def start(u, c):
-    if not await check_priv(u, c): return
-    await u.message.reply_text("🚀 <b>智能助手</b>\n\n💳 <b>购买:</b> /shop\n🧾 <b>订单:</b> /orders\n🔗 <b>订阅:</b> /sub\n🔄 <b>重置:</b> /reset_sub\n👤 <b>查询:</b> /info\n📧 <b>绑定:</b> /bind 邮箱\n\n✨ <b>群组:</b> 发送「签到」", parse_mode=ParseMode.HTML)
-
-async def bind(u, c):
-    if not await check_priv(u, c): return
-    if not c.args: return await u.message.reply_text("❌ 格式: `/bind 邮箱`", parse_mode=ParseMode.MARKDOWN)
-    user = await DataManager.get_user_by_email(c.args[0])
-    if user:
-        await redis_client.set(f"v2bot:bind:{u.effective_user.id}", c.args[0])
-        await u.message.reply_text(f"✅ 绑定成功: {c.args[0]}")
-    else: await u.message.reply_text("🚫 邮箱不存在")
-
-async def info(u, c):
-    if not await check_priv(u, c): return
-    try:
-        email = await redis_client.get(f"v2bot:bind:{u.effective_user.id}")
-        if not email: return await u.message.reply_text("⚠️ 请先绑定 /bind")
-        user = await DataManager.get_user_by_email(email)
-        if not user: return await u.message.reply_text("🚫 无法获取用户信息")
-        
-        p_name = await DataManager.get_plan_name(user.get('plan_id'))
-        used = safe_int(user.get('u')) + safe_int(user.get('d'))
-        trans = safe_int(user.get('transfer_enable'))
-        expire = datetime.fromtimestamp(safe_int(user.get('expired_at'))).strftime('%Y-%m-%d') if safe_int(user.get('expired_at')) > 0 else "长期有效"
-        
-        await u.message.reply_text(f"👤 <b>账户信息</b>\n📧 {email}\n📦 {p_name}\n⏳ 到期: {expire}\n🌊 流量: {format_bytes(used)} / {format_bytes(trans)}\n{get_progress_bar(used, trans)}", parse_mode=ParseMode.HTML)
-    except Exception as e: await u.message.reply_text(f"❌ 错误: {e}")
-
-async def sub(u, c):
-    if not await check_priv(u, c): return
-    email = await redis_client.get(f"v2bot:bind:{u.effective_user.id}")
-    if not email: return
-    user = await DataManager.get_user_by_email(email)
-    domain = await DataManager.get_sub_domain()
-    await u.message.reply_text(f"🔗 <b>订阅链接:</b>\n<code>{domain}/api/v1/client/subscribe?token={user['token']}</code>", parse_mode=ParseMode.HTML)
-
-async def reset_sub(u, c):
-    if not await check_priv(u, c): return
-    email = await redis_client.get(f"v2bot:bind:{u.effective_user.id}")
-    if not email: return
-    user = await DataManager.get_user_by_email(email)
-    msg = await u.message.reply_text("🔄 正在安全重置订阅与节点连接...")
-    try:
-        new_token = await DataManager.reset_security_direct(user['id'], email)
-        domain = await DataManager.get_sub_domain()
-        await msg.edit_text(f"✅ <b>重置成功！</b>\n\n新链接：\n<code>{domain}/api/v1/client/subscribe?token={new_token}</code>\n\n⚠️ 旧配置已失效，请重新导入。", parse_mode=ParseMode.HTML)
-    except: await msg.edit_text("❌ 重置失败")
-
-async def shop(u, c):
-    if not await check_priv(u, c): return
-    plans = await DataManager.get_active_plans()
-    if not plans: return await u.message.reply_text("📭 暂无套餐")
-    kb = [[InlineKeyboardButton(f"📦 {p['name']} - {p['month_price']/100}元", callback_data=f"step1:{p['id']}:month_price")] for p in plans]
-    await u.message.reply_text("🛒 <b>请选择套餐：</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-
-async def show_payment_methods(tn, amt, update):
-    methods = await DataManager.get_payment_methods()
-    if not methods: return await update.callback_query.edit_message_text(f"✅ 订单 {tn} 存在，但无支付方式。")
-    kb = [[InlineKeyboardButton(f"💳 {m['name']}", callback_data=f"step2:{tn}:{m['id']}")] for m in methods]
-    kb.append([InlineKeyboardButton("❌ 取消订单", callback_data=f"cancel:{tn}")])
-    await update.callback_query.edit_message_text(f"🧾 订单确认\n单号：<code>{tn}</code>\n金额：{amt}\n\n👇 请选择支付方式：", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-
-async def btn_handler(u, c):
-    q = u.callback_query; await q.answer(); data = q.data.split(":"); action = data[0]
-    tg_id = q.from_user.id; email = await redis_client.get(f"v2bot:bind:{tg_id}")
-    if not email: return
-    user = await DataManager.get_user_by_email(email)
-
-    if action == "step1":
-        pending = await DataManager.get_pending_order(user['id'])
-        if pending: await show_payment_methods(pending['trade_no'], f"{pending['total_amount']/100} 元", u); return
-        plans = await DataManager.get_active_plans()
-        plan = next((p for p in plans if p['id'] == int(data[1])), None)
-        if plan: 
-            tn = await DataManager.create_order(user['id'], plan['id'], plan['month_price'], data[2], email)
-            await show_payment_methods(tn, f"{plan['month_price']/100} 元", u)
-    elif action == "repay": await show_payment_methods(data[1], f"{int(data[2])/100} 元", u)
-    elif action == "step2":
-        trade_no, method_id = data[1], int(data[2])
-        pay_url = await asyncio.get_event_loop().run_in_executor(executor, DataManager.call_checkout_api, trade_no, method_id, user['token'])
-        if not pay_url: pay_url = f"{V2BOARD_DOMAIN}/#/order/{trade_no}"
-        await redis_client.sadd("v2bot:pending_orders", trade_no)
-        await redis_client.set(f"v2bot:order_owner:{trade_no}", tg_id, ex=7200)
-        kb = [[InlineKeyboardButton("🚀 点击跳转支付", url=pay_url)], [InlineKeyboardButton("⬅️ 返回", callback_data="back_to_shop")]]
-        await q.edit_message_text(f"✅ 支付链接已生成\n单号：<code>{trade_no}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-    elif action == "cancel": await DataManager.cancel_order(data[1], user['id']); await q.edit_message_text("🗑️ 订单已取消。")
-    elif action == "back_to_shop": await q.message.delete(); await shop(u, c)
-
-async def orders(u, c):
-    if not await check_priv(u, c): return
-    email = await redis_client.get(f"v2bot:bind:{u.effective_user.id}")
-    if not email: return
-    user = await DataManager.get_user_by_email(email)
-    ords = await DataManager.get_orders(user['id'])
-    st_map = {0:"⏳ 待支付", 1:"🔄 开通中", 2:"❌ 已取消", 3:"✅ 已完成"}
-    msg = "🧾 <b>最近订单</b>\n━━━━━━━━\n"; kb = []; has_pending = False
-    for o in ords:
-        d = datetime.fromtimestamp(o['created_at']).strftime('%m-%d %H:%M')
-        msg += f"<code>{o['trade_no']}</code>\n💰 {o['total_amount']/100}元 | {st_map.get(o['status'],'未知')}\n📅 {d}\n\n"
-        if o['status'] == 0 and not has_pending:
-            kb.append([InlineKeyboardButton(f"💳 支付待付订单", callback_data=f"repay:{o['trade_no']}:{o['total_amount']}")])
-            kb.append([InlineKeyboardButton("❌ 取消订单", callback_data=f"cancel:{o['trade_no']}")]); has_pending = True
-    await u.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-
-async def checkin(u, c):
-    tg_id = u.effective_user.id; email = await redis_client.get(f"v2bot:bind:{tg_id}")
-    if not email:
-        kb = [[InlineKeyboardButton("🔒 去私聊绑定", url=f"https://t.me/{c.bot.username}")]]
-        await u.message.reply_text("⚠️ 请先去私聊绑定账号：", reply_markup=InlineKeyboardMarkup(kb)); return
-    today = datetime.now().strftime("%Y-%m-%d")
-    if await redis_client.get(f"v2bot:checkin:{tg_id}:{today}"):
-        await u.message.reply_text("📅 <b>今天已签到</b>\n明天继续保持哦！", parse_mode=ParseMode.HTML); return
-    process_msg = await u.message.reply_text("🎲 正在祈祷运势...")
-    last_date = await redis_client.get(f"v2bot:last_date:{tg_id}")
-    streak = 1
-    if last_date == (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
-        streak = int(await redis_client.get(f"v2bot:streak:{tg_id}") or 0) + 1
-    mult = 1.0; reason = "日常签到"; is_crit = False
-    if streak % 21 == 0: mult = 4.0; reason = "👑 连签21天四倍！"
-    elif streak % 14 == 0: mult = 3.0; reason = "💎 连签14天三倍！"
-    elif streak % 7 == 0: mult = 2.0; reason = "🔥 连签7天双倍！"
-    if random.random() < NORMAL_CRIT_RATE: mult = max(mult, NORMAL_CRIT_MULT); reason += " | ✨ 幸运暴击"; is_crit = True
-    base_mb = random.randint(BASE_MIN, BASE_MAX)
-    final_bytes = int(base_mb * mult * 1024 * 1024)
-    user = await DataManager.get_user_by_email(email)
-    await DataManager.add_traffic(user['id'], final_bytes, email)
-    await redis_client.set(f"v2bot:checkin:{tg_id}:{today}", 1, ex=86400)
-    await redis_client.set(f"v2bot:last_date:{tg_id}", today); await redis_client.set(f"v2bot:streak:{tg_id}", streak)
-    header = "🎰 <b>欧皇附体！</b>" if is_crit else "🎉 <b>签到成功！</b>"
-    user_upd = await DataManager.get_user_by_email(email)
-    p_name = await DataManager.get_plan_name(user_upd.get('plan_id'))
-    used = safe_int(user_upd.get('u')) + safe_int(user_upd.get('d'))
-    trans = safe_int(user_upd.get('transfer_enable'))
-    expire = datetime.fromtimestamp(safe_int(user_upd.get('expired_at'))).strftime('%Y-%m-%d') if safe_int(user_upd.get('expired_at')) > 0 else "无限期"
-    await process_msg.edit_text(f"{header}\n👤 用户：{u.effective_user.first_name}\n🔥 连签：<b>{streak}</b> 天\n💡 {reason}\n\n📦 套餐：{p_name}\n⏳ 到期：{expire}\n🎁 奖励：x{mult} (<b>{format_bytes(final_bytes)}</b>)\n📊 使用：{format_bytes(used)} / {format_bytes(trans)}\n{get_progress_bar(used, trans)}", parse_mode=ParseMode.HTML)
-
-async def payment_monitor(bot):
-    while True:
-        try:
-            pending = await redis_client.smembers("v2bot:pending_orders")
-            if pending:
-                p_list = list(pending)
-                def _chk():
-                    with DataManager.get_db_conn() as c:
-                        with c.cursor() as cur:
-                            fmt = ','.join(['%s']*len(p_list))
-                            cur.execute(f"SELECT trade_no, total_amount, status FROM {TBL_ORDER} WHERE trade_no IN ({fmt})", tuple(p_list))
-                            return cur.fetchall()
-                ords = await asyncio.get_event_loop().run_in_executor(executor, _chk)
-                for o in ords:
-                    if o['status'] == 3:
-                        tg_id = await redis_client.get(f"v2bot:order_owner:{o['trade_no']}")
-                        if tg_id: await bot.send_message(tg_id, f"🎉 <b>支付成功！</b>\n单号：<code>{o['trade_no']}</code>", parse_mode=ParseMode.HTML)
-                        await redis_client.srem("v2bot:pending_orders", o['trade_no'])
-                    elif o['status'] == 2: await redis_client.srem("v2bot:pending_orders", o['trade_no'])
-        except: pass
-        await asyncio.sleep(15)
-
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("bind", bind)); app.add_handler(CommandHandler("info", info))
-    app.add_handler(CommandHandler("sub", sub)); app.add_handler(CommandHandler("reset_sub", reset_sub)); app.add_handler(CommandHandler("shop", shop))
-    app.add_handler(CommandHandler("orders", orders)); app.add_handler(CommandHandler("checkin", checkin)); app.add_handler(MessageHandler(filters.Regex("^签到$"), checkin))
-    app.add_handler(CallbackQueryHandler(btn_handler))
-    await app.initialize(); await app.start(); asyncio.create_task(payment_monitor(app.bot)); await app.updater.start_polling()
-    while True: await asyncio.sleep(1)
-
-if __name__ == '__main__': asyncio.run(main())
-EOF
-}
-
-# 4. 系统服务
-function create_service() {
-    cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=V2Board Bot
-After=network.target mysql.service redis.service
+Description=V2Board Telegram Bot
+After=network.target redis.service redis-server.service
+
 [Service]
 Type=simple
-WorkingDirectory=$WORK_DIR
-ExecStart=$WORK_DIR/venv/bin/python3 $WORK_DIR/bot.py
+WorkingDirectory=${WORK_DIR}
+ExecStart=${WORK_DIR}/venv/bin/python ${WORK_DIR}/bot.py
 Restart=always
+RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
+    systemctl enable --now "${SERVICE_NAME}"
+    print_ok ">>> 服务已启动"
 }
 
-function check_status() {
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        echo -e "状态: ${GREEN}运行中${PLAIN}"
-    else
-        echo -e "状态: ${RED}未运行${PLAIN}"
-    fi
-}
-
-function install_bot() { install_env; manage_config; write_bot_code; create_service; systemctl enable $SERVICE_NAME; systemctl restart $SERVICE_NAME; echo -e "${GREEN}✅ 安装/更新完成${PLAIN}"; }
-function start_bot() { systemctl start $SERVICE_NAME; echo -e "${GREEN}已启动${PLAIN}"; }
-function stop_bot() { systemctl stop $SERVICE_NAME; echo -e "${GREEN}已停止${PLAIN}"; }
-function restart_bot() { systemctl restart $SERVICE_NAME; echo -e "${GREEN}已重启${PLAIN}"; }
-function view_logs() { journalctl -u $SERVICE_NAME -f; }
-function uninstall_bot() { systemctl stop $SERVICE_NAME; systemctl disable $SERVICE_NAME; rm -f /etc/systemd/system/$SERVICE_NAME.service; rm -rf $WORK_DIR; systemctl daemon-reload; echo -e "${GREEN}卸载完成${PLAIN}"; }
-
-clear
-echo -e "${GREEN} V2Board Bot (智能平滑升级版) ${PLAIN}"; check_status
-echo " 1. 安装/更新"; echo " 2. 启动"; echo " 3. 停止"; echo " 4. 重启"; echo " 5. 日志"; echo " 6. 卸载"; echo " 0. 退出"
-read -p " 请输入: " n
-case "$n" in
-    1) install_bot ;;
-    2) start_bot ;;
-    3) stop_bot ;;
-    4) restart_bot ;;
-    5) view_logs ;;
-    6) uninstall_bot ;;
-    0) exit 0 ;;
-    *) echo "无效输入" ;;
+case "${1:-}" in
+    install)
+        ensure_root
+        install_system_packages
+        ensure_env_file
+        setup_virtualenv
+        create_service
+        print_ok "安装完成"
+        ;;
+    start)
+        ensure_root
+        systemctl start "${SERVICE_NAME}"
+        ;;
+    stop)
+        ensure_root
+        systemctl stop "${SERVICE_NAME}"
+        ;;
+    restart)
+        ensure_root
+        systemctl restart "${SERVICE_NAME}"
+        ;;
+    status)
+        ensure_root
+        systemctl status "${SERVICE_NAME}" --no-pager
+        ;;
+    logs)
+        ensure_root
+        journalctl -u "${SERVICE_NAME}" -f
+        ;;
+    uninstall)
+        ensure_root
+        systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+        systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+        systemctl daemon-reload
+        print_ok "systemd 服务已删除，项目文件仍保留在 ${WORK_DIR}"
+        ;;
+    *)
+        echo "用法: $0 {install|start|stop|restart|status|logs|uninstall}"
+        exit 1
+        ;;
 esac
